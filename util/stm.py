@@ -1,3 +1,6 @@
+import codecs
+import unicodedata
+
 class STMSegment(object):
     r"""
     Representation of an individual segment in an STM file.
@@ -13,7 +16,12 @@ class STMSegment(object):
         self._transcript  = ""
         for token in tokens[6:]:
           self._transcript += token + " "
-        self._transcript = self._transcript.strip()
+        # We need to do the encode-decode dance here because encode
+        # returns a bytes() object on Python 3, and text_to_char_array
+        # expects a string.
+        self._transcript = unicodedata.normalize("NFKD", self._transcript.strip())  \
+                                      .encode("ascii", "ignore")                    \
+                                      .decode("ascii", "ignore")
 
     @property
     def filename(self):
@@ -48,7 +56,7 @@ def parse_stm_file(stm_file):
     Parses an STM file at ``stm_file`` into a list of :class:`STMSegment`.
     """
     stm_segments = []
-    with open(stm_file) as stm_lines:
+    with codecs.open(stm_file, encoding="utf-8") as stm_lines:
         for stm_line in stm_lines:
             stmSegment = STMSegment(stm_line)
             if not "ignore_time_segment_in_scoring" == stmSegment.transcript:

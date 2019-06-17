@@ -1,208 +1,28 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function
 
-import datetime
-import json
-import numpy as np
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
-import tensorflow as tf
+
+LOG_LEVEL_INDEX = sys.argv.index('--log_level') + 1 if '--log_level' in sys.argv else 0
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = sys.argv[LOG_LEVEL_INDEX] if 0 < LOG_LEVEL_INDEX < len(sys.argv) else '3'
+
 import time
-
-from collections import OrderedDict
-from math import ceil
-from tensorflow.contrib.session_bundle import exporter
-from tensorflow.python.tools import freeze_graph
-from util.gpu import get_available_gpus
-from util.log import merge_logs
-from util.spell import correction
-from util.shared_lib import check_cupti
-from util.text import sparse_tensor_value_to_texts, wer
-from xdg import BaseDirectory as xdg
-
-ds_importer = os.environ.get('ds_importer', 'ldc93s1')
-ds_dataset_path = os.environ.get('ds_dataset_path', os.path.join('./data', ds_importer))
-
-import importlib
-ds_importer_module = importlib.import_module('util.importers.%s' % ds_importer)
-
-from util.website import maybe_publish
-
-do_fulltrace = bool(len(os.environ.get('ds_do_fulltrace', '')))
-
-if do_fulltrace:
-    check_cupti()
-
-
-# Global Constants
-# ================
-
-# The number of iterations (epochs) we will train for
-epochs = int(os.environ.get('ds_epochs', 75))
-
-# Whether to use GPU bound Warp-CTC
-use_warpctc = bool(len(os.environ.get('ds_use_warpctc', '')))
-
-# As we will employ dropout on the feedforward layers of the network,
-# we need to define a parameter `dropout_rate` that keeps track of the dropout rate for these layers
-dropout_rate = float(os.environ.get('ds_dropout_rate', 0.05))  # TODO: Validate this is a reasonable value
-
-# We allow for customisation of dropout per-layer
-dropout_rate2 = float(os.environ.get('ds_dropout_rate2', dropout_rate))
-dropout_rate3 = float(os.environ.get('ds_dropout_rate3', dropout_rate))
-dropout_rate4 = float(os.environ.get('ds_dropout_rate4', 0.0))
-dropout_rate5 = float(os.environ.get('ds_dropout_rate5', 0.0))
-dropout_rate6 = float(os.environ.get('ds_dropout_rate6', dropout_rate))
-
-dropout_rates = [ dropout_rate,
-                  dropout_rate2,
-                  dropout_rate3,
-                  dropout_rate4,
-                  dropout_rate5,
-                  dropout_rate6 ]
-no_dropout = [ 0.0 ] * 6
-
-# One more constant required of the non-recurrant layers is the clipping value of the ReLU.
-relu_clip = int(os.environ.get('ds_relu_clip', 20)) # TODO: Validate this is a reasonable value
-
-
-# Adam optimizer (http://arxiv.org/abs/1412.6980) parameters
-
-# Beta 1 parameter
-beta1 = float(os.environ.get('ds_beta1', 0.9)) # TODO: Determine a reasonable value for this
-
-# Beta 2 parameter
-beta2 = float(os.environ.get('ds_beta2', 0.999)) # TODO: Determine a reasonable value for this
-
-# Epsilon parameter
-epsilon = float(os.environ.get('ds_epsilon', 1e-8)) # TODO: Determine a reasonable value for this
-
-# Learning rate parameter
-learning_rate = float(os.environ.get('ds_learning_rate', 0.001))
-
-
-# Batch sizes
-
-# The number of elements in a training batch
-train_batch_size = int(os.environ.get('ds_train_batch_size', 1))
-
-# The number of elements in a dev batch
-dev_batch_size = int(os.environ.get('ds_dev_batch_size', 1))
-
-# The number of elements in a test batch
-test_batch_size = int(os.environ.get('ds_test_batch_size', 1))
-
-
-# Sample limits
-
-# The maximum amount of samples taken from (the beginning of) the train set - 0 meaning no limit
-limit_train = int(os.environ.get('ds_limit_train', 0))
-
-# The maximum amount of samples taken from (the beginning of) the validation set - 0 meaning no limit
-limit_dev   = int(os.environ.get('ds_limit_dev',   0))
-
-# The maximum amount of samples taken from (the beginning of) the test set - 0 meaning no limit
-limit_test  = int(os.environ.get('ds_limit_test',  0))
-
-
-# Step widths
-
-# The number of epochs we cycle through before displaying progress
-display_step = int(os.environ.get('ds_display_step', 1))
-
-# The number of epochs we cycle through before checkpointing the model
-checkpoint_step = int(os.environ.get('ds_checkpoint_step', 5))
-
-# The number of epochs we cycle through before validating the model
-validation_step = int(os.environ.get('ds_validation_step', 0))
-
-
-# Checkpointing
-
-# The directory in which checkpoints are stored
-checkpoint_dir = os.environ.get('ds_checkpoint_dir', xdg.save_data_path('deepspeech'))
-
-# Whether to resume from checkpoints when training
-restore_checkpoint = bool(int(os.environ.get('ds_restore_checkpoint', 0)))
-
-# The directory in which exported models are stored
-export_dir = os.environ.get('ds_export_dir', None)
-
-# The version number of the exported model
-export_version = 1
-
-# Whether to remove old exported models
-remove_export = bool(int(os.environ.get('ds_remove_export', 0)))
-
-
-# Reporting
-
-# The number of phrases to print out during a WER report
-report_count = int(os.environ.get('ds_report_count', 10))
-
-# Whether to log device placement of the operators to the console
-log_device_placement = bool(int(os.environ.get('ds_log_device_placement', 0)))
-
-# Whether to log gradients and variables summaries to TensorBoard during training.
-# This incurs a performance hit, so should generally only be enabled for debugging.
-log_variables = bool(len(os.environ.get('ds_log_variables', '')))
-
-
-# Geometry
-
-# The layer width to use when initialising layers
-n_hidden = int(os.environ.get('ds_n_hidden', 2048))
-
-
-# Initialization
-
-# The default random seed that is used to initialize variables. Ensures reproducibility.
-random_seed = int(os.environ.get('ds_random_seed', 4567)) # To be adjusted in case of bad luck
-
-# The default standard deviation to use when initialising weights and biases
-default_stddev = float(os.environ.get('ds_default_stddev', 0.046875))
-
-# Individual standard deviations to use when initialising particular weights and biases
-for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
-    locals()['%s_stddev' % var] = float(os.environ.get('ds_%s_stddev' % var, default_stddev))
-
-# Session settings
-
-# Standard session configuration that'll be used for all new sessions.
-session_config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=log_device_placement)
-
-
-# Geometric Constants
-# ===================
-
-# For an explanation of the meaning of the geometric constants, please refer to
-# doc/Geometry.md
-
-# Number of MFCC features
-n_input = 26 # TODO: Determine this programatically from the sample rate
-
-# The number of frames in the context
-n_context = 9 # TODO: Determine the optimal value using a validation data set
-
-# Number of units in hidden layers
-n_hidden_1 = n_hidden
-n_hidden_2 = n_hidden
-n_hidden_5 = n_hidden
-
-# LSTM cell state dimension
-n_cell_dim = n_hidden
-
-# The number of units in the third layer, which feeds in to the LSTM
-n_hidden_3 = 2 * n_cell_dim
-
-# The number of characters in the target language plus one
-n_character = 29 # TODO: Determine if this should be extended with other punctuation
-
-# The number of units in the sixth layer
-n_hidden_6 = n_character
+import numpy as np
+import progressbar
+import shutil
+import tensorflow as tf
+
+from datetime import datetime
+from ds_ctcdecoder import ctc_beam_search_decoder, Scorer
+from evaluate import evaluate
+from six.moves import zip, range
+from tensorflow.python.tools import freeze_graph, strip_unused_lib
+from util.config import Config, initialize_globals
+from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
+from util.flags import create_flags, FLAGS
+from util.logging import log_info, log_error, log_debug, log_progress, create_progressbar
 
 
 # Graph Creation
@@ -215,176 +35,180 @@ def variable_on_cpu(name, shape, initializer):
     used to create a variable in CPU memory.
     """
     # Use the /cpu:0 device for scoped operations
-    with tf.device('/cpu:0'):
+    with tf.device(Config.cpu_device):
         # Create or get apropos variable
         var = tf.get_variable(name=name, shape=shape, initializer=initializer)
     return var
 
 
-def BiRNN(batch_x, seq_length, dropout):
-    r"""
-    That done, we will define the learned variables, the weights and biases,
-    within the method ``BiRNN()`` which also constructs the neural network.
-    The variables named ``hn``, where ``n`` is an integer, hold the learned weight variables.
-    The variables named ``bn``, where ``n`` is an integer, hold the learned bias variables.
-    In particular, the first variable ``h1`` holds the learned weight matrix that
-    converts an input vector of dimension ``n_input + 2*n_input*n_context``
-    to a vector of dimension ``n_hidden_1``.
-    Similarly, the second variable ``h2`` holds the weight matrix converting
-    an input vector of dimension ``n_hidden_1`` to one of dimension ``n_hidden_2``.
-    The variables ``h3``, ``h5``, and ``h6`` are similar.
-    Likewise, the biases, ``b1``, ``b2``..., hold the biases for the various layers.
-    """
+def create_overlapping_windows(batch_x):
+    batch_size = tf.shape(batch_x)[0]
+    window_width = 2 * Config.n_context + 1
+    num_channels = Config.n_input
+
+    # Create a constant convolution filter using an identity matrix, so that the
+    # convolution returns patches of the input tensor as is, and we can create
+    # overlapping windows over the MFCCs.
+    eye_filter = tf.constant(np.eye(window_width * num_channels)
+                               .reshape(window_width, num_channels, window_width * num_channels), tf.float32) # pylint: disable=bad-continuation
+
+    # Create overlapping windows
+    batch_x = tf.nn.conv1d(batch_x, eye_filter, stride=1, padding='SAME')
+
+    # Remove dummy depth dimension and reshape into [batch_size, n_windows, window_width, n_input]
+    batch_x = tf.reshape(batch_x, [batch_size, -1, window_width, num_channels])
+
+    return batch_x
+
+
+def dense(name, x, units, dropout_rate=None, relu=True):
+    with tf.variable_scope(name):
+        bias = variable_on_cpu('bias', [units], tf.zeros_initializer())
+        weights = variable_on_cpu('weights', [x.shape[-1], units], tf.contrib.layers.xavier_initializer())
+
+    output = tf.nn.bias_add(tf.matmul(x, weights), bias)
+
+    if relu:
+        output = tf.minimum(tf.nn.relu(output), FLAGS.relu_clip)
+
+    if dropout_rate is not None:
+        output = tf.nn.dropout(output, rate=dropout_rate)
+
+    return output
+
+
+def rnn_impl_lstmblockfusedcell(x, seq_length, previous_state, reuse):
+    # Forward direction cell:
+    fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim, reuse=reuse)
+
+    output, output_state = fw_cell(inputs=x,
+                                   dtype=tf.float32,
+                                   sequence_length=seq_length,
+                                   initial_state=previous_state)
+
+    return output, output_state
+
+
+def rnn_impl_static_rnn(x, seq_length, previous_state, reuse):
+    # Forward direction cell:
+    fw_cell = tf.nn.rnn_cell.LSTMCell(Config.n_cell_dim, reuse=reuse)
+
+    # Split rank N tensor into list of rank N-1 tensors
+    x = [x[l] for l in range(x.shape[0])]
+
+    # We parametrize the RNN implementation as the training and inference graph
+    # need to do different things here.
+    output, output_state = tf.nn.static_rnn(cell=fw_cell,
+                                            inputs=x,
+                                            initial_state=previous_state,
+                                            dtype=tf.float32,
+                                            sequence_length=seq_length)
+    output = tf.concat(output, 0)
+
+    return output, output_state
+
+
+def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_lstmblockfusedcell):
+    layers = {}
+
     # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
-    batch_x_shape = tf.shape(batch_x)
+    batch_size = tf.shape(batch_x)[0]
+
+    # Create overlapping feature windows if needed
+    if overlap:
+        batch_x = create_overlapping_windows(batch_x)
 
     # Reshaping `batch_x` to a tensor with shape `[n_steps*batch_size, n_input + 2*n_input*n_context]`.
     # This is done to prepare the batch for input into the first layer which expects a tensor of rank `2`.
 
     # Permute n_steps and batch_size
-    batch_x = tf.transpose(batch_x, [1, 0, 2])
+    batch_x = tf.transpose(batch_x, [1, 0, 2, 3])
     # Reshape to prepare input for first layer
-    batch_x = tf.reshape(batch_x, [-1, n_input + 2*n_input*n_context]) # (n_steps*batch_size, n_input + 2*n_input*n_context)
+    batch_x = tf.reshape(batch_x, [-1, Config.n_input + 2*Config.n_input*Config.n_context]) # (n_steps*batch_size, n_input + 2*n_input*n_context)
+    layers['input_reshaped'] = batch_x
 
     # The next three blocks will pass `batch_x` through three hidden layers with
     # clipped RELU activation and dropout.
-
-    # 1st layer
-    b1 = variable_on_cpu('b1', [n_hidden_1], tf.random_normal_initializer(stddev=b1_stddev))
-    h1 = variable_on_cpu('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.random_normal_initializer(stddev=h1_stddev))
-    layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), relu_clip)
-    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
-
-    # 2nd layer
-    b2 = variable_on_cpu('b2', [n_hidden_2], tf.random_normal_initializer(stddev=b2_stddev))
-    h2 = variable_on_cpu('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=h2_stddev))
-    layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), relu_clip)
-    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
-
-    # 3rd layer
-    b3 = variable_on_cpu('b3', [n_hidden_3], tf.random_normal_initializer(stddev=b3_stddev))
-    h3 = variable_on_cpu('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=h3_stddev))
-    layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), relu_clip)
-    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
-
-    # Now we create the forward and backward LSTM units.
-    # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
-
-    # Forward direction cell:
-    lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
-    lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
-                                                 input_keep_prob=1.0 - dropout[3],
-                                                 output_keep_prob=1.0 - dropout[3],
-                                                 seed=random_seed)
-    # Backward direction cell:
-    lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
-    lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
-                                                 input_keep_prob=1.0 - dropout[4],
-                                                 output_keep_prob=1.0 - dropout[4],
-                                                 seed=random_seed)
+    layers['layer_1'] = layer_1 = dense('layer_1', batch_x, Config.n_hidden_1, dropout_rate=dropout[0])
+    layers['layer_2'] = layer_2 = dense('layer_2', layer_1, Config.n_hidden_2, dropout_rate=dropout[1])
+    layers['layer_3'] = layer_3 = dense('layer_3', layer_2, Config.n_hidden_3, dropout_rate=dropout[2])
 
     # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
-    # as the LSTM BRNN expects its input to be of shape `[max_time, batch_size, input_size]`.
-    layer_3 = tf.reshape(layer_3, [-1, batch_x_shape[0], n_hidden_3])
+    # as the LSTM RNN expects its input to be of shape `[max_time, batch_size, input_size]`.
+    layer_3 = tf.reshape(layer_3, [-1, batch_size, Config.n_hidden_3])
 
-    # Now we feed `layer_3` into the LSTM BRNN cell and obtain the LSTM BRNN output.
-    outputs, output_states = tf.nn.bidirectional_dynamic_rnn(cell_fw=lstm_fw_cell,
-                                                             cell_bw=lstm_bw_cell,
-                                                             inputs=layer_3,
-                                                             dtype=tf.float32,
-                                                             time_major=True,
-                                                             sequence_length=seq_length)
+    # Run through parametrized RNN implementation, as we use different RNNs
+    # for training and inference
+    output, output_state = rnn_impl(layer_3, seq_length, previous_state, reuse)
 
-    # Reshape outputs from two tensors each of shape [n_steps, batch_size, n_cell_dim]
-    # to a single tensor of shape [n_steps*batch_size, 2*n_cell_dim]
-    outputs = tf.concat(outputs, 2)
-    outputs = tf.reshape(outputs, [-1, 2*n_cell_dim])
+    # Reshape output from a tensor of shape [n_steps, batch_size, n_cell_dim]
+    # to a tensor of shape [n_steps*batch_size, n_cell_dim]
+    output = tf.reshape(output, [-1, Config.n_cell_dim])
+    layers['rnn_output'] = output
+    layers['rnn_output_state'] = output_state
 
-    # Now we feed `outputs` to the fifth hidden layer with clipped RELU activation and dropout
-    b5 = variable_on_cpu('b5', [n_hidden_5], tf.random_normal_initializer(stddev=b5_stddev))
-    h5 = variable_on_cpu('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=h5_stddev))
-    layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), relu_clip)
-    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
+    # Now we feed `output` to the fifth hidden layer with clipped RELU activation
+    layers['layer_5'] = layer_5 = dense('layer_5', output, Config.n_hidden_5, dropout_rate=dropout[5])
 
-    # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
-    # creating `n_classes` dimensional vectors, the logits.
-    b6 = variable_on_cpu('b6', [n_hidden_6], tf.random_normal_initializer(stddev=b6_stddev))
-    h6 = variable_on_cpu('h6', [n_hidden_5, n_hidden_6], tf.random_normal_initializer(stddev=h6_stddev))
-    layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
+    # Now we apply a final linear layer creating `n_classes` dimensional vectors, the logits.
+    layers['layer_6'] = layer_6 = dense('layer_6', layer_5, Config.n_hidden_6, relu=False)
 
     # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
     # to the slightly more useful shape [n_steps, batch_size, n_hidden_6].
     # Note, that this differs from the input in that it is time-major.
-    layer_6 = tf.reshape(layer_6, [-1, batch_x_shape[0], n_hidden_6])
+    layer_6 = tf.reshape(layer_6, [-1, batch_size, Config.n_hidden_6], name='raw_logits')
+    layers['raw_logits'] = layer_6
 
     # Output shape: [n_steps, batch_size, n_hidden_6]
-    return layer_6
+    return layer_6, layers
 
 
 # Accuracy and Loss
 # =================
 
-# In accord with "Deep Speech: Scaling up end-to-end speech recognition"
+# In accord with 'Deep Speech: Scaling up end-to-end speech recognition'
 # (http://arxiv.org/abs/1412.5567),
 # the loss function used by our network should be the CTC loss function
 # (http://www.cs.toronto.edu/~graves/preprint.pdf).
 # Conveniently, this loss function is implemented in TensorFlow.
 # Thus, we can simply make use of this implementation to define our loss.
 
-def calculate_accuracy_and_loss(batch_set, dropout):
-    r"""
-    This routine beam search decodes a mini-batch and calculates the loss and accuracy.
-    Next to total and average loss it returns the accuracy,
+def calculate_mean_edit_distance_and_loss(iterator, dropout, reuse):
+    r'''
+    This routine beam search decodes a mini-batch and calculates the loss and mean edit distance.
+    Next to total and average loss it returns the mean edit distance,
     the decoded result and the batch's original Y.
-    """
+    '''
     # Obtain the next batch of data
-    batch_x, batch_seq_len, batch_y = batch_set.next_batch()
+    (batch_x, batch_seq_len), batch_y = iterator.get_next()
 
-    # Calculate the logits of the batch using BiRNN
-    logits = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout)
+    # Calculate the logits of the batch
+    logits, _ = create_model(batch_x, batch_seq_len, dropout, reuse=reuse)
 
-    # Compute the CTC loss using either TensorFlow's `ctc_loss` or Baidu's `warp_ctc_loss`.
-    if use_warpctc:
-        total_loss = tf.contrib.warpctc.warp_ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
-    else:
-        total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
+    # Compute the CTC loss using TensorFlow's `ctc_loss`
+    total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
 
     # Calculate the average loss across the batch
     avg_loss = tf.reduce_mean(total_loss)
 
-    # Beam search decode the batch
-    decoded, _ = tf.nn.ctc_beam_search_decoder(logits, batch_seq_len, merge_repeated=False)
-
-    # Compute the edit (Levenshtein) distance
-    distance = tf.edit_distance(tf.cast(decoded[0], tf.int32), batch_y)
-
-    # Compute the accuracy
-    accuracy = tf.reduce_mean(distance)
-
-    # Finally we return the
-    # - calculated total and
-    # - average losses,
-    # - the Levenshtein distance,
-    # - the recognition accuracy,
-    # - the decoded batch and
-    # - the original batch_y (which contains the verified transcriptions).
-    return total_loss, avg_loss, distance, accuracy, decoded, batch_y
+    # Finally we return the average loss
+    return avg_loss
 
 
 # Adam Optimization
 # =================
 
-# In constrast to "Deep Speech: Scaling up end-to-end speech recognition"
+# In contrast to 'Deep Speech: Scaling up end-to-end speech recognition'
 # (http://arxiv.org/abs/1412.5567),
-# in which "Nesterov's Accelerated Gradient Descent"
+# in which 'Nesterov's Accelerated Gradient Descent'
 # (www.cs.toronto.edu/~fritz/absps/momentum.pdf) was used,
 # we will use the Adam method for optimization (http://arxiv.org/abs/1412.6980),
 # because, generally, it requires less fine-tuning.
 def create_optimizer():
-    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate,
-                                       beta1=beta1,
-                                       beta2=beta2,
-                                       epsilon=epsilon)
+    optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate,
+                                       beta1=FLAGS.beta1,
+                                       beta2=FLAGS.beta2,
+                                       epsilon=FLAGS.epsilon)
     return optimizer
 
 
@@ -399,163 +223,104 @@ def create_optimizer():
 # A tower is specified by two properties:
 # * **Scope** - A scope, as provided by `tf.name_scope()`,
 # is a means to isolate the operations within a tower.
-# For example, all operations within "tower 0" could have their name prefixed with `tower_0/`.
+# For example, all operations within 'tower 0' could have their name prefixed with `tower_0/`.
 # * **Device** - A hardware device, as provided by `tf.device()`,
 # on which all operations within the tower execute.
-# For example, all operations of "tower 0" could execute on the first GPU `tf.device('/gpu:0')`.
+# For example, all operations of 'tower 0' could execute on the first GPU `tf.device('/gpu:0')`.
 
-# As we are introducing one tower for each GPU, first we must determine how many GPU's are available
-# Get a list of the available gpu's ['/gpu:0', '/gpu:1'...]
-available_devices = get_available_gpus()
-
-# If there are no GPU's use the CPU
-if 0 == len(available_devices):
-    available_devices = ['/cpu:0']
-
-
-def get_tower_results(batch_set, optimizer=None):
-    r"""
+def get_tower_results(iterator, optimizer, dropout_rates):
+    r'''
     With this preliminary step out of the way, we can for each GPU introduce a
-    tower for which's batch we calculate
-
-    * The CTC decodings ``decoded``,
-    * The (total) loss against the outcome (Y) ``total_loss``,
-    * The loss averaged over the whole batch ``avg_loss``,
-    * The optimization gradient (computed based on the averaged loss),
-    * The Levenshtein distances between the decodings and their transcriptions ``distance``,
-    * The accuracy of the outcome averaged over the whole batch ``accuracy``
-
-    and retain the original ``labels`` (Y).
-    ``decoded``, ``labels``, the optimization gradient, ``distance``, ``accuracy``,
-    ``total_loss`` and ``avg_loss`` are collected into the corresponding arrays
-    ``tower_decodings``, ``tower_labels``, ``tower_gradients``, ``tower_distances``,
-    ``tower_accuracies``, ``tower_total_losses``, ``tower_avg_losses`` (dimension 0 being the tower).
-    Finally this new method ``get_tower_results()`` will return those tower arrays.
-    In case of ``tower_accuracies`` and ``tower_avg_losses``, it will return the
-    averaged values instead of the arrays.
-    """
-    # Tower labels to return
-    tower_labels = []
-
-    # Tower decodings to return
-    tower_decodings = []
-
-    # Tower distances to return
-    tower_distances = []
-
-    # Tower total batch losses to return
-    tower_total_losses = []
+    tower for which's batch we calculate and return the optimization gradients
+    and the average loss across towers.
+    '''
+    # To calculate the mean of the losses
+    tower_avg_losses = []
 
     # Tower gradients to return
     tower_gradients = []
 
-    # To calculate the mean of the accuracies
-    tower_accuracies = []
-
-    # To calculate the mean of the losses
-    tower_avg_losses = []
-
     with tf.variable_scope(tf.get_variable_scope()):
         # Loop over available_devices
-        for i in xrange(len(available_devices)):
+        for i in range(len(Config.available_devices)):
             # Execute operations of tower i on device i
-            with tf.device(available_devices[i]):
+            device = Config.available_devices[i]
+            with tf.device(device):
                 # Create a scope for all operations of tower i
-                with tf.name_scope('tower_%d' % i) as scope:
-                    # Calculate the avg_loss and accuracy and retrieve the decoded
+                with tf.name_scope('tower_%d' % i):
+                    # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
-                    total_loss, avg_loss, distance, accuracy, decoded, labels = \
-                        calculate_accuracy_and_loss(batch_set, no_dropout if optimizer is None else dropout_rates)
+                    avg_loss = calculate_mean_edit_distance_and_loss(iterator, dropout_rates, reuse=i > 0)
 
                     # Allow for variables to be re-used by the next tower
                     tf.get_variable_scope().reuse_variables()
 
-                    # Retain tower's labels (Y)
-                    tower_labels.append(labels)
-
-                    # Retain tower's decoded batch
-                    tower_decodings.append(decoded)
-
-                    # Retain tower's distances
-                    tower_distances.append(distance)
-
-                    # Retain tower's total losses
-                    tower_total_losses.append(total_loss)
-
-                    if optimizer is not None:
-                        # Compute gradients for model parameters using tower's mini-batch
-                        gradients = optimizer.compute_gradients(avg_loss)
-
-                        # Retain tower's gradients
-                        tower_gradients.append(gradients)
-
-                    # Retain tower's accuracy
-                    tower_accuracies.append(accuracy)
-
                     # Retain tower's avg losses
                     tower_avg_losses.append(avg_loss)
 
-    # Return the results tuple, the gradients, and the means of accuracies and losses
-    return (tower_labels, tower_decodings, tower_distances, tower_total_losses), \
-           tower_gradients, \
-           tf.reduce_mean(tower_accuracies, 0), \
-           tf.reduce_mean(tower_avg_losses, 0)
+                    # Compute gradients for model parameters using tower's mini-batch
+                    gradients = optimizer.compute_gradients(avg_loss)
+
+                    # Retain tower's gradients
+                    tower_gradients.append(gradients)
+
+
+    avg_loss_across_towers = tf.reduce_mean(tower_avg_losses, 0)
+
+    tf.summary.scalar(name='step_loss', tensor=avg_loss_across_towers, collections=['step_summaries'])
+
+    # Return gradients and the average loss
+    return tower_gradients, avg_loss_across_towers
 
 
 def average_gradients(tower_gradients):
-    r"""
+    r'''
     A routine for computing each variable's average of the gradients obtained from the GPUs.
-    Note also that this code acts as a syncronization point as it requires all
+    Note also that this code acts as a synchronization point as it requires all
     GPUs to be finished with their mini-batch before it can run to completion.
-    """
+    '''
     # List of average gradients to return to the caller
     average_grads = []
 
-    # Loop over gradient/variable pairs from all towers
-    for grad_and_vars in zip(*tower_gradients):
-        # Introduce grads to store the gradients for the current variable
-        grads = []
+    # Run this on cpu_device to conserve GPU memory
+    with tf.device(Config.cpu_device):
+        # Loop over gradient/variable pairs from all towers
+        for grad_and_vars in zip(*tower_gradients):
+            # Introduce grads to store the gradients for the current variable
+            grads = []
 
-        # Loop over the gradients for the current variable
-        for g, _ in grad_and_vars:
-            # Add 0 dimension to the gradients to represent the tower.
-            expanded_g = tf.expand_dims(g, 0)
-            # Append on a 'tower' dimension which we will average over below.
-            grads.append(expanded_g)
+            # Loop over the gradients for the current variable
+            for g, _ in grad_and_vars:
+                # Add 0 dimension to the gradients to represent the tower.
+                expanded_g = tf.expand_dims(g, 0)
+                # Append on a 'tower' dimension which we will average over below.
+                grads.append(expanded_g)
 
-        # Average over the 'tower' dimension
-        grad = tf.concat(grads, 0)
-        grad = tf.reduce_mean(grad, 0)
+            # Average over the 'tower' dimension
+            grad = tf.concat(grads, 0)
+            grad = tf.reduce_mean(grad, 0)
 
-        # Create a gradient/variable tuple for the current variable with its average gradient
-        grad_and_var = (grad, grad_and_vars[0][1])
+            # Create a gradient/variable tuple for the current variable with its average gradient
+            grad_and_var = (grad, grad_and_vars[0][1])
 
-        # Add the current tuple to average_grads
-        average_grads.append(grad_and_var)
+            # Add the current tuple to average_grads
+            average_grads.append(grad_and_var)
 
     # Return result to caller
     return average_grads
 
-
-def apply_gradients(optimizer, average_grads):
-    r"""
-    Now next we introduce a function to apply the averaged gradients to update the
-    model's paramaters on the CPU
-    """
-    apply_gradient_op = optimizer.apply_gradients(average_grads)
-    return apply_gradient_op
 
 
 # Logging
 # =======
 
 def log_variable(variable, gradient=None):
-    r"""
+    r'''
     We introduce a function for logging a tensor variable's current state.
     It logs scalar values for the mean, standard deviation, minimum and maximum.
     Furthermore it logs a histogram of its state and (if given) of an optimization gradient.
-    """
-    name = variable.name
+    '''
+    name = variable.name.replace(':', '_')
     mean = tf.reduce_mean(variable)
     tf.summary.scalar(name='%s/mean'   % name, tensor=mean)
     tf.summary.scalar(name='%s/sttdev' % name, tensor=tf.sqrt(tf.reduce_mean(tf.square(variable - mean))))
@@ -572,716 +337,500 @@ def log_variable(variable, gradient=None):
 
 
 def log_grads_and_vars(grads_and_vars):
-    r"""
+    r'''
     Let's also introduce a helper function for logging collections of gradient/variable tuples.
-    """
+    '''
     for gradient, variable in grads_and_vars:
         log_variable(variable, gradient=gradient)
 
 
-# Finally we define the top directory for all logs and our current log sub-directory of it.
-# We also add some log helpers.
-logs_dir = os.environ.get('ds_logs_dir', 'logs')
-log_dir = '%s/%s' % (logs_dir, time.strftime("%Y%m%d-%H%M%S"))
+def try_loading(session, saver, checkpoint_filename, caption):
+    try:
+        checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir, checkpoint_filename)
+        if not checkpoint:
+            return False
+        checkpoint_path = checkpoint.model_checkpoint_path
+        saver.restore(session, checkpoint_path)
+        restored_step = session.run(tf.train.get_global_step())
+        log_info('Restored variables from %s checkpoint at %s, step %d' % (caption, checkpoint_path, restored_step))
+        return True
+    except tf.errors.InvalidArgumentError as e:
+        log_error(str(e))
+        log_error('The checkpoint in {0} does not match the shapes of the model.'
+                  ' Did you change alphabet.txt or the --n_hidden parameter'
+                  ' between train runs using the same checkpoint dir? Try moving'
+                  ' or removing the contents of {0}.'.format(checkpoint_path))
+        sys.exit(1)
 
-def get_git_revision_hash():
-    return subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
-
-def get_git_branch():
-    return subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).strip()
-
-
-# Helpers
-# =======
-
-def calculate_and_print_wer_report(caption, results_tuple):
-    r"""
-    This routine will print a WER report with a given caption.
-    It'll print the `mean` WER plus summaries of the ``ds_report_count`` top lowest
-    loss items from the provided WER results tuple
-    (only items with WER!=0 and ordered by their WER).
-    """
-    items = zip(*results_tuple)
-
-    count = len(items)
-    mean_wer = 0.0
-    for i in xrange(count):
-        item = items[i]
-        # If distance > 0 we know that there is a WER > 0 and have to calculate it
-        if item[2] > 0:
-            # Replace result by language model corrected result
-            item = (item[0], correction(item[1]), item[2], item[3])
-            # Replacing accuracy tuple entry by the WER
-            item = (item[0], item[1], wer(item[0], item[1]), item[3])
-            # Replace items[i] with new item
-            items[i] = item
-            mean_wer = mean_wer + item[2]
-
-    # Getting the mean WER from the accumulated one
-    mean_wer = mean_wer / float(count)
-
-    # Filter out all items with WER=0
-    items = [a for a in items if a[2] > 0]
-
-    # Order the remaining items by their loss (lowest loss on top)
-    items.sort(key=lambda a: a[3])
-
-    # Take only the first report_count items
-    items = items[:report_count]
-
-    # Order this top ten items by their WER (lowest WER on top)
-    items.sort(key=lambda a: a[2])
-
-    print "%s WER: %f" % (caption, mean_wer)
-    for a in items:
-        print "-" * 80
-        print "    WER:    %f" % a[2]
-        print "    loss:   %f" % a[3]
-        print "    source: \"%s\"" % a[0]
-        print "    result: \"%s\"" % a[1]
-
-    return mean_wer
-
-
-def collect_results(results_tuple, returns):
-    r"""
-    This routine will help collecting partial results for the WER reports.
-    The ``results_tuple`` is composed of an array of the original labels,
-    an array of the corresponding decodings, an array of the corrsponding
-    distances and an array of the corresponding losses. ``returns`` is built up
-    in a similar way, containing just the unprocessed results of one
-    ``session.run`` call (effectively of one batch).
-    Labels and decodings are converted to text before splicing them into their
-    corresponding results_tuple lists. In the case of decodings,
-    for now we just pick the first available path.
-    """
-    # Each of the arrays within results_tuple will get extended by a batch of each available device
-    for i in xrange(len(available_devices)):
-        # Collect the labels
-        results_tuple[0].extend(sparse_tensor_value_to_texts(returns[0][i]))
-
-        # Collect the decodings - at the moment we default to the first one
-        results_tuple[1].extend(sparse_tensor_value_to_texts(returns[1][i][0]))
-
-        # Collect the distances
-        results_tuple[2].extend(returns[2][i])
-
-        # Collect the losses
-        results_tuple[3].extend(returns[3][i])
-
-
-# For reporting we also need a standard way to do time measurements.
-def stopwatch(start_duration=0):
-    r"""
-    This function will toggle a stopwatch.
-    The first call starts it, second call stops it, third call continues it etc.
-    So if you want to measure the accumulated time spent in a certain area of the code,
-    you can surround that code by stopwatch-calls like this:
-
-    .. code:: python
-
-        fun_time = 0 # initializes a stopwatch
-        [...]
-        for i in xrange(10):
-          [...]
-          # Starts/continues the stopwatch - fun_time is now a point in time (again)
-          fun_time = stopwatch(fun_time)
-          fun()
-          # Pauses the stopwatch - fun_time is now a duration
-          fun_time = stopwatch(fun_time)
-        [...]
-        # The following line only makes sense after an even call of :code:`fun_time = stopwatch(fun_time)`.
-        print "Time spent in fun():", format_duration(fun_time)
-
-    """
-    if start_duration == 0:
-        return datetime.datetime.utcnow()
-    else:
-        return datetime.datetime.utcnow() - start_duration
-
-def format_duration(duration):
-    """Formats the result of an even stopwatch call as hours:minutes:seconds"""
-    m, s = divmod(duration.seconds, 60)
-    h, m = divmod(m, 60)
-    return "%d:%02d:%02d" % (h, m, s)
-
-
-# Execution
-# =========
-
-
-# To run our different graphs in separate sessions,
-# we first need to create some common infrastructure.
-#
-# At first we introduce the functions `read_data_sets` and `read_data_set` to read in data sets.
-# The first returns a `DataSets` object of the selected importer, containing all available sets.
-# The latter takes the name of the required data set
-# (`'train'`, `'dev'` or `'test'`) as string and returns the respective set.
-def read_data_sets(set_names):
-    r"""
-    Returns a :class:`DataSets` object of the selected importer, containing all available sets.
-    """
-    # Obtain all the data sets
-    return ds_importer_module.read_data_sets(ds_dataset_path,
-                                             train_batch_size,
-                                             dev_batch_size,
-                                             test_batch_size,
-                                             n_input,
-                                             n_context,
-                                             limit_dev=limit_dev,
-                                             limit_test=limit_test,
-                                             limit_train=limit_train,
-                                             sets=set_names)
-
-def read_data_set(set_name):
-    r"""
-    ``set_name``: string, the name of the required data set (``'train'``, ``'dev'`` or ``'test'``)
-
-    Returns the respective set.
-    """
-    # Obtain all the data sets
-    data_sets = read_data_sets([set_name])
-
-    # Pick the train, dev, or test data set from it
-    return getattr(data_sets, set_name)
-
-
-def create_execution_context(set_name):
-    r"""
-    The most important data structure that will be shared among the following
-    routines is a so called ``execution context``.
-    It's a tuple with four elements: The graph, the data set (one of train/dev/test),
-    the top level graph entry point tuple from ``get_tower_results()``
-    and a saver object for persistence.
-
-    Let's at first introduce the construction routine for an execution context.
-    It takes the data set's name as string ("train", "dev" or "test")
-    and returns the execution context tuple.
-
-    An execution context tuple is of the form ``(graph, data_set, tower_results, saver)``
-    when not training. ``graph`` is the ``tf.Graph`` in which the operators reside.
-    ``data_set`` is the selected data set (train, dev, or test).
-    ``tower_results`` is the result of a call to ``get_tower_results()``.
-    ``saver`` is a ``tf.train.Saver`` which can be used to save the model.
-
-    When training an execution context is of the form
-    ``(graph, data_set, tower_results, saver, apply_gradient_op, merged, writer)``.
-    The first four items are the same as in the above case.
-    ``apply_gradient_op`` is an operator that applies the gradents to the learned parameters.
-    ``merged`` contains all summaries for tensorboard.
-    Finally, ``writer`` is the ``tf.train.SummaryWriter`` used to write summaries for tensorboard.
-    """
-    graph = tf.Graph()
-    with graph.as_default():
-        # Set the global random seed for determinism
-        tf.set_random_seed(random_seed)
-
-        # Get the required data set
-        data_set = read_data_set(set_name)
-
-        # Define bool to indicate if data_set is the training set
-        is_train = set_name == 'train'
-
-        # If training create optimizer
-        optimizer = create_optimizer() if is_train else None
-
-        # Get the data_set specific graph end-points
-        tower_results = get_tower_results(data_set, optimizer=optimizer)
-
-        if is_train:
-            # Average tower gradients
-            avg_tower_gradients = average_gradients(tower_results[1])
-
-            # Add logging of averaged gradients
-            if log_variables:
-                log_grads_and_vars(avg_tower_gradients)
-
-            # Apply gradients to modify the model
-            apply_gradient_op = apply_gradients(optimizer, avg_tower_gradients)
-
-        # Create a saver to checkpoint the model
-        saver = tf.train.Saver(tf.global_variables())
-
-        if is_train:
-            # Prepare tensor board logging
-            merged = tf.summary.merge_all()
-            writer = tf.summary.FileWriter(log_dir, graph)
-            return (graph, data_set, tower_results, saver, apply_gradient_op, merged, writer)
-        else:
-            return (graph, data_set, tower_results, saver)
-
-
-def start_execution_context(execution_context, model_path=None):
-    r"""
-    Now let's introduce a routine for starting an execution context.
-    By passing in the execution context and the file path of the model, it will
-
-    1. Create a new session using the execution model's graph,
-    2. Load (restore) the model from the file path into it,
-    3. Start the associated queue and runner threads.
-
-    Finally it will return the new session.
-    """
-    # Obtain the Graph in which to execute
-    graph = execution_context[0]
-
-    # Create a new session and load the execution context's graph into it
-    session = tf.Session(config=session_config, graph=graph)
-
-    # Set graph as the default Graph
-    with graph.as_default():
-        if model_path is None:
-            # Init all variables for first use
-            init_op = tf.global_variables_initializer()
-            session.run(init_op)
-        else:
-            # Loading the model into the session
-            execution_context[3].restore(session, model_path)
-
-        # Create Coordinator to manage threads
-        coord = tf.train.Coordinator()
-
-        # Start queue runner threads
-        managed_threads = tf.train.start_queue_runners(sess=session, coord=coord)
-
-        # Start importer's queue threads
-        managed_threads = managed_threads + execution_context[1].start_queue_threads(session, coord)
-
-    return session, coord, managed_threads
-
-
-def persist_model(execution_context, session, checkpoint_path, global_step):
-    r"""
-    This helper method persists the contained model to disk and returns
-    the model's filename, constructed from ``checkpoint_path`` and ``global_step``
-    """
-    # Saving session's model into checkpoint dir
-    return execution_context[3].save(session, checkpoint_path, global_step=global_step)
-
-
-def stop_execution_context(execution_context, session, coord, managed_threads, checkpoint_path=None, global_step=None):
-    r"""
-    The following helper method stops an execution context.
-    Before closing the provided ``session``, it will persist the contained model to disk.
-    The model's filename will be returned.
-    """
-    # If the model is not persisted, we'll return 'None'
-    hibernation_path = None
-
-    if checkpoint_path is not None and global_step is not None:
-        # Saving session's model into checkpoint dir
-        hibernation_path = persist_model(execution_context, session, checkpoint_path, global_step)
-
-    # Close importer's queue
-    execution_context[1].close_queue(session)
-
-    # Request managed threads stop
-    coord.request_stop()
-
-    # Wait until managed threads stop
-    coord.join(managed_threads)
-
-    # Free all allocated resources of the session
-    session.close()
-
-    return hibernation_path
-
-
-def calculate_loss_and_report(execution_context, session, epoch=-1, query_report=False):
-    r"""
-    Now let's introduce the main routine for training and inference.
-    It takes a started execution context (given by ``execution_context``),
-    a ``Session`` (``session``), an optional epoch index (``epoch``)
-    and a flag (``query_report``) which indicates whether to calculate the WER
-    report data or not.
-    Its main duty is to iterate over all batches and calculate the mean loss.
-    If a non-negative epoch is provided, it will also optimize the parameters.
-    If ``query_report`` is ``False``, the default, it will return a tuple which
-    contains the mean loss.
-    If ``query_report`` is ``True``, the mean accuracy and individual results
-    are also included in the returned tuple.
-    """
-    # An epoch of -1 means no train run
-    do_training = epoch >= 0
-
-    # Unpack variables
-    if do_training:
-        graph, data_set, tower_results, saver, apply_gradient_op, merged, writer = execution_context
-    else:
-        graph, data_set, tower_results, saver = execution_context
-    results_params, _, avg_accuracy, avg_loss = tower_results
-
-    batches_per_device = ceil(float(data_set.total_batches) / len(available_devices))
-
-    total_loss = 0.0
-    params = OrderedDict()
-    params['avg_loss'] = avg_loss
-
-    # Facilitate a train run
-    if do_training:
-        params['apply_gradient_op'] = apply_gradient_op
-        if log_variables:
-            params['merged'] = merged
-
-    # Requirements to display a WER report
-    if query_report:
-        # Reset accuracy
-        total_accuracy = 0.0
-        # Create report results tuple
-        report_results = ([],[],[],[])
-        # Extend the session.run parameters
-        params['sample_results'] = [results_params, avg_accuracy]
-
-    # Get the index of each of the session fetches so we can recover the results more easily
-    param_idx = dict(zip(params.keys(), range(len(params))))
-    params = params.values()
-
-    # Loop over the batches
-    for batch in range(int(batches_per_device)):
-        extra_params = { }
-        if do_training and do_fulltrace:
-            loss_run_metadata            = tf.RunMetadata()
-            extra_params['options']      = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-            extra_params['run_metadata'] = loss_run_metadata
-
-        # Compute the batch
-        result = session.run(params, **extra_params)
-
-        # Add batch to loss
-        total_loss += result[param_idx['avg_loss']]
-
-        if do_training:
-            # Log all variable states in current step
-            step = epoch * data_set.total_batches + batch * len(available_devices)
-            if log_variables:
-                writer.add_summary(result[param_idx['merged']], step)
-            if do_fulltrace:
-                writer.add_run_metadata(loss_run_metadata, 'loss_epoch%d_batch%d'   % (epoch, batch))
-            writer.flush()
-
-        if query_report:
-            sample_results = result[param_idx['sample_results']]
-            # Collect individual sample results
-            collect_results(report_results, sample_results[0])
-            # Add batch to total_accuracy
-            total_accuracy += sample_results[1]
-
-    # Returning the batch set result tuple
-    loss = total_loss / batches_per_device
-    if query_report:
-        return (loss, total_accuracy / batches_per_device, report_results)
-    else:
-        return (loss, None, None)
-
-
-def print_report(caption, batch_set_result):
-    r"""
-    This routine will print a report from a provided batch set result tuple.
-    It takes a caption for titling the output plus the batch set result tuple.
-    If the batch set result tuple contains accuracy and a report results tuple,
-    a complete WER report will be calculated, printed and its mean WER returned.
-    Otherwise it will just print the loss and return ``None``.
-    """
-    # Unpacking batch set result tuple
-    loss, accuracy, results_tuple = batch_set_result
-
-    # We always have a loss value
-    title = caption + " loss=" + "{:.9f}".format(loss)
-
-    mean_wer = None
-    if accuracy is not None and results_tuple is not None:
-        title += " avg_cer=" + "{:.9f}".format(accuracy)
-        mean_wer = calculate_and_print_wer_report(title, results_tuple)
-    else:
-        print title
-
-    return mean_wer
-
-
-def run_set(set_name, model_path=None, query_report=False):
-    r"""
-    Let's also introduce a routine that facilitates obtaining results from a data set
-    (given by its name in ``set_name``) - from execution context creation to closing the session.
-    If a model's filename is provided by ``model_path``,
-    it will initialize the session by loading the given model into it.
-    It will return the loss and - if ``query_report=True`` - also the accuracy and the report results tuple.
-    """
-    # Creating the execution context
-    execution_context = create_execution_context(set_name)
-
-    # Starting the execution context
-    session, coord, managed_threads = start_execution_context(execution_context, model_path=model_path)
-
-    # Applying the batches
-    batch_set_result = calculate_loss_and_report(execution_context, session, query_report=query_report)
-
-    # Cleaning up
-    stop_execution_context(execution_context, session, coord, managed_threads)
-
-    # Returning batch_set_result from calculate_loss_and_report
-    return batch_set_result
-
-
-# Training
-# ========
 
 def train():
-    r"""
-    Now, as we have prepared all the apropos operators and methods,
-    we can create the method which trains the network.
-    """
-    print "STARTING Optimization\n"
-    global_time = stopwatch()
-    global_train_time = 0
+    # Create training and validation datasets
+    train_set = create_dataset(FLAGS.train_files.split(','),
+                               batch_size=FLAGS.train_batch_size,
+                               cache_path=FLAGS.feature_cache)
 
-    # Creating the training execution context
-    train_context = create_execution_context('train')
+    iterator = tf.data.Iterator.from_structure(train_set.output_types,
+                                               train_set.output_shapes,
+                                               output_classes=train_set.output_classes)
 
-    # Init recent word error rate levels
-    train_wer = 0.0
-    dev_wer = 0.0
+    # Make initialization ops for switching between the two sets
+    train_init_op = iterator.make_initializer(train_set)
 
-    hibernation_path = None
-    execution_context_running = False
+    if FLAGS.dev_files:
+        dev_csvs = FLAGS.dev_files.split(',')
+        dev_sets = [create_dataset([csv], batch_size=FLAGS.dev_batch_size) for csv in dev_csvs]
+        dev_init_ops = [iterator.make_initializer(dev_set) for dev_set in dev_sets]
 
-    # Possibly restore checkpoint
-    start_epoch = 0
-    if restore_checkpoint:
-        checkpoint = tf.train.get_checkpoint_state(checkpoint_dir)
-        if checkpoint and checkpoint.model_checkpoint_path:
-            hibernation_path = checkpoint.model_checkpoint_path
-            start_epoch = int(checkpoint.model_checkpoint_path.split('-')[-1])
-            print 'Resuming training from epoch %d' % (start_epoch + 1)
+    # Dropout
+    dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
+    dropout_feed_dict = {
+        dropout_rates[0]: FLAGS.dropout_rate,
+        dropout_rates[1]: FLAGS.dropout_rate2,
+        dropout_rates[2]: FLAGS.dropout_rate3,
+        dropout_rates[3]: FLAGS.dropout_rate4,
+        dropout_rates[4]: FLAGS.dropout_rate5,
+        dropout_rates[5]: FLAGS.dropout_rate6,
+    }
+    no_dropout_feed_dict = {
+        rate: 0. for rate in dropout_rates
+    }
 
-    # Loop over the data set for training_epochs epochs
-    for epoch in range(start_epoch, epochs):
-        print "STARTING Epoch", '%04d' % (epoch)
+    # Building the graph
+    optimizer = create_optimizer()
+    gradients, loss = get_tower_results(iterator, optimizer, dropout_rates)
 
-        if epoch == 0 or hibernation_path is not None:
-            if hibernation_path is not None:
-                print "Resuming training session from", "%s" % hibernation_path, "..."
-            session, coord, managed_threads = start_execution_context(train_context, hibernation_path)
-            # Flag that execution context has started
-            execution_context_running = True
-        # The next loop should not load the model, unless it got set again in the meantime (by validation)
-        hibernation_path = None
+    # Average tower gradients across GPUs
+    avg_tower_gradients = average_gradients(gradients)
+    log_grads_and_vars(avg_tower_gradients)
 
-        overall_time = stopwatch()
-        train_time = 0
+    # global_step is automagically incremented by the optimizer
+    global_step = tf.train.get_or_create_global_step()
+    apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
-        # Determine if we want to display, validate, checkpoint on this iteration
-        is_display_step = display_step > 0 and ((epoch + 1) % display_step == 0 or epoch == epochs - 1)
-        is_validation_step = validation_step > 0 and (epoch + 1) % validation_step == 0
-        is_checkpoint_step = (checkpoint_step > 0 and (epoch + 1) % checkpoint_step == 0) or epoch == epochs - 1
+    # Summaries
+    step_summaries_op = tf.summary.merge_all('step_summaries')
+    step_summary_writers = {
+        'train': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'train'), max_queue=120),
+        'dev': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'dev'), max_queue=120)
+    }
 
-        print "Training model..."
-        global_train_time = stopwatch(global_train_time)
-        train_time = stopwatch(train_time)
-        result = calculate_loss_and_report(train_context, session, epoch=epoch, query_report=is_display_step)
-        global_train_time = stopwatch(global_train_time)
-        train_time = stopwatch(train_time)
+    # Checkpointing
+    checkpoint_saver = tf.train.Saver(max_to_keep=FLAGS.max_to_keep)
+    checkpoint_path = os.path.join(FLAGS.checkpoint_dir, 'train')
+    checkpoint_filename = 'checkpoint'
 
-        result = print_report("Training", result)
-        # If there was a WER calculated, we keep it
-        if result is not None:
-            train_wer = result
+    best_dev_saver = tf.train.Saver(max_to_keep=1)
+    best_dev_path = os.path.join(FLAGS.checkpoint_dir, 'best_dev')
+    best_dev_filename = 'best_dev_checkpoint'
 
-        # Checkpoint step (Validation also checkpoints)
-        if is_checkpoint_step and not is_validation_step:
-            print "Hibernating training session into directory", "%s" % checkpoint_dir
-            checkpoint_path = os.path.join(checkpoint_dir, 'model.ckpt')
-            # Saving session's model into checkpoint path
-            persist_model(train_context, session, checkpoint_path, epoch)
-        # Validation step
-        if is_validation_step:
-            print "Hibernating training session into directory", "%s" % checkpoint_dir
-            checkpoint_path = os.path.join(checkpoint_dir, 'model.ckpt')
-            # If the hibernation_path is set, the next epoch loop will load the model
-            hibernation_path = stop_execution_context(train_context, session, coord, managed_threads, checkpoint_path=checkpoint_path, global_step=epoch)
-            # Flag that execution context has stoped
-            execution_context_running = False
+    initializer = tf.global_variables_initializer()
 
-            # Validating the model in a fresh session
-            print "Validating model..."
-            result = run_set('dev', model_path=hibernation_path, query_report=True)
-            result = print_report("Validation", result)
-            # If there was a WER calculated, we keep it
-            if result is not None:
-                dev_wer = result
+    with tf.Session(config=Config.session_config) as session:
+        log_debug('Session opened.')
 
-        overall_time = stopwatch(overall_time)
+        tf.get_default_graph().finalize()
 
-        print "FINISHED Epoch", '%04d' % (epoch),\
-              "  Overall epoch time:", format_duration(overall_time),\
-              "  Training time:", format_duration(train_time)
-        print
+        # Loading or initializing
+        loaded = False
+        if FLAGS.load in ['auto', 'last']:
+            loaded = try_loading(session, checkpoint_saver, checkpoint_filename, 'most recent')
+        if not loaded and FLAGS.load in ['auto', 'best']:
+            loaded = try_loading(session, best_dev_saver, best_dev_filename, 'best validation')
+        if not loaded:
+            if FLAGS.load in ['auto', 'init']:
+                log_info('Initializing variables...')
+                session.run(initializer)
+            else:
+                log_error('Unable to load %s model from specified checkpoint dir'
+                          ' - consider using load option "auto" or "init".' % FLAGS.load)
+                sys.exit(1)
 
-    # If the last iteration step was no validation, we still have to save the model
-    if hibernation_path is None or execution_context_running:
-        hibernation_path = stop_execution_context(train_context, session, coord, managed_threads, checkpoint_path=checkpoint_path, global_step=epoch)
+        def run_set(set_name, epoch, init_op, dataset=None):
+            is_train = set_name == 'train'
+            train_op = apply_gradient_op if is_train else []
+            feed_dict = dropout_feed_dict if is_train else no_dropout_feed_dict
 
-    # Indicate optimization has concluded
-    print "FINISHED Optimization",\
-          "  Overall time:", format_duration(stopwatch(global_time)),\
-          "  Training time:", format_duration(global_train_time)
-    print
+            total_loss = 0.0
+            step_count = 0
 
-    return train_wer, dev_wer, hibernation_path
+            step_summary_writer = step_summary_writers.get(set_name)
+            checkpoint_time = time.time()
 
-if __name__ == "__main__":
-    # As everything is prepared, we are now able to do the training.
-    # Define CPU as device on which the muti-gpu training is orchestrated
-    with tf.device('/cpu:0'):
-        # Take start time for time measurement
-        time_started = datetime.datetime.utcnow()
+            # Setup progress bar
+            class LossWidget(progressbar.widgets.FormatLabel):
+                def __init__(self):
+                    progressbar.widgets.FormatLabel.__init__(self, format='Loss: %(mean_loss)f')
 
-        # Train the network
-        last_train_wer, last_dev_wer, hibernation_path = train()
+                def __call__(self, progress, data, **kwargs):
+                    data['mean_loss'] = total_loss / step_count if step_count else 0.0
+                    return progressbar.widgets.FormatLabel.__call__(self, progress, data, **kwargs)
 
-        # Take final time for time measurement
-        time_finished = datetime.datetime.utcnow()
+            prefix = 'Epoch {} | {:>10}'.format(epoch, 'Training' if is_train else 'Validation')
+            widgets = [' | ', progressbar.widgets.Timer(),
+                       ' | Steps: ', progressbar.widgets.Counter(),
+                       ' | ', LossWidget()]
+            suffix = ' | Dataset: {}'.format(dataset) if dataset else None
+            pbar = create_progressbar(prefix=prefix, widgets=widgets, suffix=suffix).start()
 
-        # Calculate duration in seconds
-        duration = time_finished - time_started
-        duration = duration.days * 86400 + duration.seconds
+            # Initialize iterator to the appropriate dataset
+            session.run(init_op)
 
-        # Finally the model is tested against some unbiased data-set
-        print "Testing model"
-        result = run_set('test', model_path=hibernation_path, query_report=True)
-        test_wer = print_report("Test", result)
+            # Batch loop
+            while True:
+                try:
+                    _, current_step, batch_loss, step_summary = \
+                        session.run([train_op, global_step, loss, step_summaries_op],
+                                    feed_dict=feed_dict)
+                except tf.errors.OutOfRangeError:
+                    break
 
+                total_loss += batch_loss
+                step_count += 1
 
-    # Finally, we restore the trained variables into a simpler graph that we can export for serving.
-    # Don't export a model if no export directory has been set
-    if export_dir:
-        with tf.device('/cpu:0'):
-            tf.reset_default_graph()
-            session = tf.Session(config=session_config)
+                pbar.update(step_count)
 
-            # Run inference
+                step_summary_writer.add_summary(step_summary, current_step)
 
-            # Input tensor will be of shape [batch_size, n_steps, n_input + 2*n_input*n_context]
-            input_tensor = tf.placeholder(tf.float32, [None, None, n_input + 2*n_input*n_context], name='input_node')
+                if is_train and FLAGS.checkpoint_secs > 0 and time.time() - checkpoint_time > FLAGS.checkpoint_secs:
+                    checkpoint_saver.save(session, checkpoint_path, global_step=current_step)
+                    checkpoint_time = time.time()
 
-            # Calculate input sequence length. This is done by tiling n_steps, batch_size times.
-            # If there are multiple sequences, it is assumed they are padded with zeros to be of
-            # the same length.
-            n_items  = tf.slice(tf.shape(input_tensor), [0], [1])
-            n_steps = tf.slice(tf.shape(input_tensor), [1], [1])
-            seq_length = tf.tile(n_steps, n_items)
+            pbar.finish()
+            mean_loss = total_loss / step_count if step_count > 0 else 0.0
+            return mean_loss, step_count
 
-            # Calculate the logits of the batch using BiRNN
-            logits = BiRNN(input_tensor, tf.to_int64(seq_length), no_dropout)
+        log_info('STARTING Optimization')
+        train_start_time = datetime.utcnow()
+        best_dev_loss = float('inf')
+        dev_losses = []
+        try:
+            for epoch in range(FLAGS.epochs):
+                # Training
+                log_progress('Training epoch %d...' % epoch)
+                train_loss, _ = run_set('train', epoch, train_init_op)
+                log_progress('Finished training epoch %d - loss: %f' % (epoch, train_loss))
+                checkpoint_saver.save(session, checkpoint_path, global_step=global_step)
 
-            # Beam search decode the batch
-            decoded, _ = tf.nn.ctc_beam_search_decoder(logits, seq_length, merge_repeated=False)
-            decoded = tf.convert_to_tensor(
-                [tf.sparse_tensor_to_dense(sparse_tensor) for sparse_tensor in decoded], name='output_node')
+                if FLAGS.dev_files:
+                    # Validation
+                    dev_loss = 0.0
+                    total_steps = 0
+                    for csv, init_op in zip(dev_csvs, dev_init_ops):
+                        log_progress('Validating epoch %d on %s...' % (epoch, csv))
+                        set_loss, steps = run_set('dev', epoch, init_op, dataset=csv)
+                        dev_loss += set_loss * steps
+                        total_steps += steps
+                        log_progress('Finished validating epoch %d on %s - loss: %f' % (epoch, csv, set_loss))
+                    dev_loss = dev_loss / total_steps
 
-            # TODO: Transform the decoded output to a string
+                    dev_losses.append(dev_loss)
 
-            # Create a saver and exporter using variables from the above newly created graph
-            saver = tf.train.Saver(tf.global_variables())
-            model_exporter = exporter.Exporter(saver)
+                    if dev_loss < best_dev_loss:
+                        best_dev_loss = dev_loss
+                        save_path = best_dev_saver.save(session, best_dev_path, global_step=global_step, latest_filename=best_dev_filename)
+                        log_info("Saved new best validating model with loss %f to: %s" % (best_dev_loss, save_path))
 
-            # Restore variables from training checkpoint
-            # TODO: This restores the most recent checkpoint, but if we use validation to counterract
-            #       over-fitting, we may want to restore an earlier checkpoint.
-            checkpoint = tf.train.get_checkpoint_state(checkpoint_dir)
-            checkpoint_path = checkpoint.model_checkpoint_path
-            saver.restore(session, checkpoint_path)
-            print 'Restored checkpoint at training epoch %d' % (int(checkpoint_path.split('-')[-1]) + 1)
-
-            # Initialise the model exporter and export the model
-            model_exporter.init(session.graph.as_graph_def(),
-                                named_graph_signatures = {
-                                    'inputs': exporter.generic_signature(
-                                        { 'input': input_tensor }),
-                                    'outputs': exporter.generic_signature(
-                                        { 'outputs': decoded})})
-            if remove_export:
-                actual_export_dir = os.path.join(export_dir, '%08d' % export_version)
-                if os.path.isdir(actual_export_dir):
-                    print 'Removing old export'
-                    shutil.rmtree(actual_export_dir)
-            try:
-                # Export serving model
-                model_exporter.export(export_dir, tf.constant(export_version), session)
-
-                # Export graph
-                input_graph_name = 'input_graph.pb'
-                tf.train.write_graph(session.graph, export_dir, input_graph_name, as_text=False)
-
-                # Freeze graph
-                input_graph_path = os.path.join(export_dir, input_graph_name)
-                input_saver_def_path = ''
-                input_binary = True
-                output_node_names = 'output_node'
-                restore_op_name = 'save/restore_all'
-                filename_tensor_name = 'save/Const:0'
-                output_graph_path = os.path.join(export_dir, 'output_graph.pb')
-                clear_devices = False
-                freeze_graph.freeze_graph(input_graph_path, input_saver_def_path,
-                                          input_binary, checkpoint_path, output_node_names,
-                                          restore_op_name, filename_tensor_name,
-                                          output_graph_path, clear_devices, '')
-
-                print 'Models exported at %s' % (export_dir)
-            except RuntimeError:
-                print  sys.exc_info()[1]
+                    # Early stopping
+                    if FLAGS.early_stop and len(dev_losses) >= FLAGS.es_steps:
+                        mean_loss = np.mean(dev_losses[-FLAGS.es_steps:-1])
+                        std_loss = np.std(dev_losses[-FLAGS.es_steps:-1])
+                        dev_losses = dev_losses[-FLAGS.es_steps:]
+                        log_debug('Checking for early stopping (last %d steps) validation loss: '
+                                  '%f, with standard deviation: %f and mean: %f' %
+                                  (FLAGS.es_steps, dev_losses[-1], std_loss, mean_loss))
+                        if dev_losses[-1] > np.max(dev_losses[:-1]) or \
+                           (abs(dev_losses[-1] - mean_loss) < FLAGS.es_mean_th and std_loss < FLAGS.es_std_th):
+                            log_info('Early stop triggered as (for last %d steps) validation loss:'
+                                     ' %f with standard deviation: %f and mean: %f' %
+                                     (FLAGS.es_steps, dev_losses[-1], std_loss, mean_loss))
+                            break
+        except KeyboardInterrupt:
+            pass
+        log_info('FINISHED optimization in {}'.format(datetime.utcnow() - train_start_time))
+    log_debug('Session closed.')
 
 
-    # Logging Hyper Parameters and Results
-    # ====================================
+def test():
+    evaluate(FLAGS.test_files.split(','), create_model, try_loading)
 
-    # Now, as training and test are done, we persist the results alongside
-    # with the involved hyper parameters for further reporting.
-    data_sets = read_data_sets(["train", "dev", "test"])
 
-    with open('%s/%s' % (log_dir, 'hyper.json'), 'w') as dump_file:
-        json.dump({
-            'context': {
-                'time_started': time_started.isoformat(),
-                'time_finished': time_finished.isoformat(),
-                'git_hash': get_git_revision_hash(),
-                'git_branch': get_git_branch()
+def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
+    batch_size = batch_size if batch_size > 0 else None
+
+    # Create feature computation graph
+    input_samples = tf.placeholder(tf.float32, [Config.audio_window_samples], 'input_samples')
+    samples = tf.expand_dims(input_samples, -1)
+    mfccs, _ = samples_to_mfccs(samples, FLAGS.audio_sample_rate)
+    mfccs = tf.identity(mfccs, name='mfccs')
+
+    # Input tensor will be of shape [batch_size, n_steps, 2*n_context+1, n_input]
+    # This shape is read by the native_client in DS_CreateModel to know the
+    # value of n_steps, n_context and n_input. Make sure you update the code
+    # there if this shape is changed.
+    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2 * Config.n_context + 1, Config.n_input], name='input_node')
+    seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
+
+    if batch_size <= 0:
+        # no state management since n_step is expected to be dynamic too (see below)
+        previous_state = previous_state_c = previous_state_h = None
+    else:
+        if tflite:
+            previous_state_c = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_c')
+            previous_state_h = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_h')
+        else:
+            previous_state_c = variable_on_cpu('previous_state_c', [batch_size, Config.n_cell_dim], initializer=None)
+            previous_state_h = variable_on_cpu('previous_state_h', [batch_size, Config.n_cell_dim], initializer=None)
+
+        previous_state = tf.contrib.rnn.LSTMStateTuple(previous_state_c, previous_state_h)
+
+    # One rate per layer
+    no_dropout = [None] * 6
+
+    if tflite:
+        rnn_impl = rnn_impl_static_rnn
+    else:
+        rnn_impl = rnn_impl_lstmblockfusedcell
+
+    logits, layers = create_model(batch_x=input_tensor,
+                                  seq_length=seq_length if FLAGS.use_seq_length else None,
+                                  dropout=no_dropout,
+                                  previous_state=previous_state,
+                                  overlap=False,
+                                  rnn_impl=rnn_impl)
+
+    # TF Lite runtime will check that input dimensions are 1, 2 or 4
+    # by default we get 3, the middle one being batch_size which is forced to
+    # one on inference graph, so remove that dimension
+    if tflite:
+        logits = tf.squeeze(logits, [1])
+
+    # Apply softmax for CTC decoder
+    logits = tf.nn.softmax(logits)
+
+    if batch_size <= 0:
+        if tflite:
+            raise NotImplementedError('dynamic batch_size does not support tflite nor streaming')
+        if n_steps > 0:
+            raise NotImplementedError('dynamic batch_size expect n_steps to be dynamic too')
+        return (
+            {
+                'input': input_tensor,
+                'input_lengths': seq_length,
             },
-            'parameters': {
-                'learning_rate': learning_rate,
-                'beta1': beta1,
-                'beta2': beta2,
-                'epsilon': epsilon,
-                'epochs': epochs,
-                'train_batch_size': train_batch_size,
-                'dev_batch_size': dev_batch_size,
-                'test_batch_size': test_batch_size,
-                'validation_step': validation_step,
-                'dropout_rates': dropout_rates,
-                'relu_clip': relu_clip,
-                'n_input': n_input,
-                'n_context': n_context,
-                'n_hidden_1': n_hidden_1,
-                'n_hidden_2': n_hidden_2,
-                'n_hidden_3': n_hidden_3,
-                'n_hidden_5': n_hidden_5,
-                'n_hidden_6': n_hidden_6,
-                'n_cell_dim': n_cell_dim,
-                'n_character': n_character,
-                'total_batches_train': data_sets.train.total_batches,
-                'total_batches_validation': data_sets.dev.total_batches,
-                'total_batches_test': data_sets.test.total_batches,
-                'data_set': {
-                    'name': ds_importer
-                }
+            {
+                'outputs': tf.identity(logits, name='logits'),
             },
-            'results': {
-                'duration': duration,
-                'last_train_wer': last_train_wer,
-                'last_validation_wer': last_dev_wer,
-                'test_wer': test_wer
-            }
-        }, dump_file, sort_keys=True, indent=4)
+            layers
+        )
 
-    # Let's also re-populate a central JS file, that contains all the dumps at once.
-    merge_logs(logs_dir)
-    maybe_publish()
+    new_state_c, new_state_h = layers['rnn_output_state']
+    if tflite:
+        logits = tf.identity(logits, name='logits')
+        new_state_c = tf.identity(new_state_c, name='new_state_c')
+        new_state_h = tf.identity(new_state_h, name='new_state_h')
+
+        inputs = {
+            'input': input_tensor,
+            'previous_state_c': previous_state_c,
+            'previous_state_h': previous_state_h,
+            'input_samples': input_samples,
+        }
+
+        if FLAGS.use_seq_length:
+            inputs.update({'input_lengths': seq_length})
+
+        outputs = {
+            'outputs': logits,
+            'new_state_c': new_state_c,
+            'new_state_h': new_state_h,
+            'mfccs': mfccs,
+        }
+    else:
+        zero_state = tf.zeros([batch_size, Config.n_cell_dim], tf.float32)
+        initialize_c = tf.assign(previous_state_c, zero_state)
+        initialize_h = tf.assign(previous_state_h, zero_state)
+        initialize_state = tf.group(initialize_c, initialize_h, name='initialize_state')
+        with tf.control_dependencies([tf.assign(previous_state_c, new_state_c), tf.assign(previous_state_h, new_state_h)]):
+            logits = tf.identity(logits, name='logits')
+
+        inputs = {
+            'input': input_tensor,
+            'input_lengths': seq_length,
+            'input_samples': input_samples,
+        }
+        outputs = {
+            'outputs': logits,
+            'initialize_state': initialize_state,
+            'mfccs': mfccs,
+        }
+
+    return inputs, outputs, layers
+
+def file_relative_read(fname):
+    return open(os.path.join(os.path.dirname(__file__), fname)).read()
+
+
+def export():
+    r'''
+    Restores the trained variables into a simpler graph that will be exported for serving.
+    '''
+    log_info('Exporting the model...')
+    from tensorflow.python.framework.ops import Tensor, Operation
+
+    inputs, outputs, _ = create_inference_graph(batch_size=FLAGS.export_batch_size, n_steps=FLAGS.n_steps, tflite=FLAGS.export_tflite)
+    output_names_tensors = [tensor.op.name for tensor in outputs.values() if isinstance(tensor, Tensor)]
+    output_names_ops = [op.name for op in outputs.values() if isinstance(op, Operation)]
+    output_names = ",".join(output_names_tensors + output_names_ops)
+
+    if not FLAGS.export_tflite:
+        mapping = {v.op.name: v for v in tf.global_variables() if not v.op.name.startswith('previous_state_')}
+    else:
+        # Create a saver using variables from the above newly created graph
+        def fixup(name):
+            if name.startswith('rnn/lstm_cell/'):
+                return name.replace('rnn/lstm_cell/', 'lstm_fused_cell/')
+            return name
+
+        mapping = {fixup(v.op.name): v for v in tf.global_variables()}
+
+    saver = tf.train.Saver(mapping)
+
+    # Restore variables from training checkpoint
+    checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
+    checkpoint_path = checkpoint.model_checkpoint_path
+
+    output_filename = 'output_graph.pb'
+    if FLAGS.remove_export:
+        if os.path.isdir(FLAGS.export_dir):
+            log_info('Removing old export')
+            shutil.rmtree(FLAGS.export_dir)
+    try:
+        output_graph_path = os.path.join(FLAGS.export_dir, output_filename)
+
+        if not os.path.isdir(FLAGS.export_dir):
+            os.makedirs(FLAGS.export_dir)
+
+        def do_graph_freeze(output_file=None, output_node_names=None, variables_blacklist=None):
+            frozen = freeze_graph.freeze_graph_with_def_protos(
+                input_graph_def=tf.get_default_graph().as_graph_def(),
+                input_saver_def=saver.as_saver_def(),
+                input_checkpoint=checkpoint_path,
+                output_node_names=output_node_names,
+                restore_op_name=None,
+                filename_tensor_name=None,
+                output_graph=output_file,
+                clear_devices=False,
+                variable_names_blacklist=variables_blacklist,
+                initializer_nodes='')
+
+            input_node_names = []
+            return strip_unused_lib.strip_unused(
+                input_graph_def=frozen,
+                input_node_names=input_node_names,
+                output_node_names=output_node_names.split(','),
+                placeholder_type_enum=tf.float32.as_datatype_enum)
+
+        if not FLAGS.export_tflite:
+            frozen_graph = do_graph_freeze(output_node_names=output_names, variables_blacklist='previous_state_c,previous_state_h')
+            frozen_graph.version = int(file_relative_read('GRAPH_VERSION').strip())
+
+            # Add a no-op node to the graph with metadata information to be loaded by the native client
+            metadata = frozen_graph.node.add()
+            metadata.name = 'model_metadata'
+            metadata.op = 'NoOp'
+            metadata.attr['sample_rate'].i = FLAGS.audio_sample_rate
+            metadata.attr['feature_win_len'].i = FLAGS.feature_win_len
+            metadata.attr['feature_win_step'].i = FLAGS.feature_win_step
+            if FLAGS.export_language:
+                metadata.attr['language'].s = FLAGS.export_language.encode('ascii')
+
+            with open(output_graph_path, 'wb') as fout:
+                fout.write(frozen_graph.SerializeToString())
+        else:
+            frozen_graph = do_graph_freeze(output_node_names=output_names, variables_blacklist='')
+            output_tflite_path = os.path.join(FLAGS.export_dir, output_filename.replace('.pb', '.tflite'))
+
+            converter = tf.lite.TFLiteConverter(frozen_graph, input_tensors=inputs.values(), output_tensors=outputs.values())
+            converter.post_training_quantize = True
+            # AudioSpectrogram and Mfcc ops are custom but have built-in kernels in TFLite
+            converter.allow_custom_ops = True
+            tflite_model = converter.convert()
+
+            with open(output_tflite_path, 'wb') as fout:
+                fout.write(tflite_model)
+
+            log_info('Exported model for TF Lite engine as {}'.format(os.path.basename(output_tflite_path)))
+
+        log_info('Models exported at %s' % (FLAGS.export_dir))
+    except RuntimeError as e:
+        log_error(str(e))
+
+
+def do_single_file_inference(input_file_path):
+    with tf.Session(config=Config.session_config) as session:
+        inputs, outputs, _ = create_inference_graph(batch_size=1, n_steps=-1)
+
+        # Create a saver using variables from the above newly created graph
+        mapping = {v.op.name: v for v in tf.global_variables() if not v.op.name.startswith('previous_state_')}
+        saver = tf.train.Saver(mapping)
+
+        # Restore variables from training checkpoint
+        # TODO: This restores the most recent checkpoint, but if we use validation to counteract
+        #       over-fitting, we may want to restore an earlier checkpoint.
+        checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
+        if not checkpoint:
+            log_error('Checkpoint directory ({}) does not contain a valid checkpoint state.'.format(FLAGS.checkpoint_dir))
+            exit(1)
+
+        checkpoint_path = checkpoint.model_checkpoint_path
+        saver.restore(session, checkpoint_path)
+        session.run(outputs['initialize_state'])
+
+        features, features_len = audiofile_to_features(input_file_path)
+
+        # Add batch dimension
+        features = tf.expand_dims(features, 0)
+        features_len = tf.expand_dims(features_len, 0)
+
+        # Evaluate
+        features = create_overlapping_windows(features).eval(session=session)
+        features_len = features_len.eval(session=session)
+
+        logits = outputs['outputs'].eval(feed_dict={
+            inputs['input']: features,
+            inputs['input_lengths']: features_len,
+        }, session=session)
+
+        logits = np.squeeze(logits)
+
+        scorer = Scorer(FLAGS.lm_alpha, FLAGS.lm_beta,
+                        FLAGS.lm_binary_path, FLAGS.lm_trie_path,
+                        Config.alphabet)
+        decoded = ctc_beam_search_decoder(logits, Config.alphabet, FLAGS.beam_width, scorer=scorer)
+        # Print highest probability result
+        print(decoded[0][1])
+
+
+def main(_):
+    initialize_globals()
+
+    if FLAGS.train_files:
+        tf.reset_default_graph()
+        tf.set_random_seed(FLAGS.random_seed)
+        train()
+
+    if FLAGS.test_files:
+        tf.reset_default_graph()
+        test()
+
+    if FLAGS.export_dir:
+        tf.reset_default_graph()
+        export()
+
+    if FLAGS.one_shot_infer:
+        tf.reset_default_graph()
+        do_single_file_inference(FLAGS.one_shot_infer)
+
+if __name__ == '__main__':
+    create_flags()
+    tf.app.run(main)
